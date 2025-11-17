@@ -1,0 +1,148 @@
+// -----------------------------------------------------------
+// Sentinel-2 image for specific date (no cloud masking)
+// Author: Nitun Paul
+// -----------------------------------------------------------
+
+// 1️⃣ Load AOI
+var aoi = ee.FeatureCollection('projects/ee-nitunpaul3/assets/Barishal_city');
+Map.centerObject(aoi, 11);
+
+// 2️⃣ Load Sentinel-2 Surface Reflectance for a specific date
+var image = ee.ImageCollection('COPERNICUS/S2_SR')
+  .filterBounds(aoi)
+  .filterDate('2025-01-15', '2025-02-16')   // ✅ specific date
+  .sort('CLOUDY_PIXEL_PERCENTAGE')         // sort by cloud %
+  .first()
+  .clip(aoi);
+
+// 3️⃣ Print cloud cover percentage
+var cloudCover = image.get('CLOUDY_PIXEL_PERCENTAGE');
+print('Cloud Cover (%) : ', cloudCover);
+
+// 4️⃣ Add true color image (WITHOUT cloud masking)
+Map.addLayer(image.clip(aoi), 
+    {bands: ['B4', 'B3', 'B2'], min: 0, max: 3000}, 
+    'Sentinel-2 True Color');
+  // ⭐ only cloud-free filtering
+
+
+// True Color
+Map.addLayer(
+  image,
+  {bands: ['B4', 'B3', 'B2'], min: 0, max: 3000},
+  "Sentinel-2 Cloud-Free"
+);
+
+// ====================================================================
+// 3️⃣ Bands for Classification
+// ====================================================================
+var bands = ['B2','B3','B4','B8','B11','B12'];
+
+// ====================================================================
+// 4️⃣ Load Training Samples
+// ====================================================================
+var training = Vegetation
+  .merge(Agricultural_Land)
+  .merge(Bare_soil)
+  .merge(Water_body)
+  .merge(Build_up_area);
+
+var label = 'Class';
+
+// ====================================================================
+// 5️⃣ Sample the Training Data
+// ====================================================================
+var samples = image.select(bands).sampleRegions({
+  collection: training,
+  properties: [label],
+  scale: 10
+});
+
+// Train/Test split
+var split = samples.randomColumn('random');
+var trainSet = split.filter(ee.Filter.lt('random', 0.7));
+var testSet  = split.filter(ee.Filter.gte('random', 0.7));
+
+// ====================================================================
+// 6️⃣ Train Classifier (Random Forest)
+// ====================================================================
+var classifier = ee.Classifier.smileRandomForest(100)
+  .train(trainSet, label, bands);
+
+// ====================================================================
+// 7️⃣ Classify the Image
+// ====================================================================
+var classified = image.select(bands).classify(classifier);
+
+// Palette
+var palette = [
+  '#113aff', // 0 Agricultural Land
+  '#cc3712', // 1 Bare Soil
+  '#ff0000', // 2 Built-up
+  '#0fdc37', // 3 Vegetation
+  '#1bdff0'  // 4 Water Body
+];
+
+// Add to Map
+Map.addLayer(
+  classified,
+  {min: 0, max: 4, palette: palette},
+  'Sentinel-2 LULC (Cloud-Free)'
+);
+
+// ====================================================================
+// 8️⃣ Accuracy Assessment
+// ====================================================================
+var validated = testSet.classify(classifier);
+var cm = validated.errorMatrix('Class', 'classification');
+print("Acquisition Date:", image.date());
+print("Confusion Matrix:", cm);
+print("Overall Accuracy:", cm.accuracy());
+print("Kappa:", cm.kappa());
+print("Producer's Accuracy:", cm.producersAccuracy());
+print("User's Accuracy:", cm.consumersAccuracy());
+
+// ====================================================================
+// 9️⃣ Legend
+// ====================================================================
+var legend = ui.Panel({
+  style: {position: 'bottom-left', padding: '8px', backgroundColor: 'white'}
+});
+
+legend.add(ui.Label({
+  value: 'LULC Legend (Sentinel-2)',
+  style: {fontWeight: 'bold', fontSize: '15px'}
+}));
+
+var classNames = [
+  'Agricultural Land',
+  'Bare Soil',
+  'Built-up Area',
+  'Vegetation',
+  'Water Body'
+];
+
+for (var i=0; i<classNames.length; i++) {
+  var colorBox = ui.Label({
+    style: {
+      backgroundColor: palette[i],
+      padding: '10px',
+      margin: '0 6px 4px 4px'
+    }
+  });
+  var desc = ui.Label({value: classNames[i]});
+  legend.add(ui.Panel([colorBox, desc], ui.Panel.Layout.Flow('horizontal')));
+}
+
+Map.add(legend);
+
+// ====================================================================
+// 🔟 Export Classified Sentinel-2 LULC
+// ====================================================================
+Export.image.toDrive({
+  image: classified,
+  description: 'Sentinel2_LULC_CloudFree_2025',
+  scale: 10,
+  region: aoi,
+  maxPixels: 1e13
+});
