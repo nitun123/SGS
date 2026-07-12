@@ -1,0 +1,199 @@
+// =======================================================================
+// BARISHAL CITY LULC – Landsat 9 only (B1–B7)
+// =======================================================================
+
+// 1️⃣ Load AOI (Shapefile)
+var aoi = shapefile.geometry();
+Map.centerObject(aoi, 14);
+Map.addLayer(aoi, {color: 'red'}, 'AOI - Barishal City');
+
+// 2️⃣ Load Landsat 9 Surface Reflectance (Collection 2 Tier 1 L2)
+var landsatCollection = ee.ImageCollection('LANDSAT/LC08/C02/T1_L2')  // L9 only
+  .filterBounds(aoi)
+  .filterDate('2025-02-01', '2025-02-28')   // Dry season window
+  .sort('CLOUD_COVER');                     // Lowest cloud first
+
+// ---- Scale SR_B1–SR_B7 (2.75e-05 * DN - 0.2) ----
+// Official C2 L2 SR scaling for Landsat 8/9. [web:4][web:10][web:22]
+function scaleLandsat9(image) {
+  var scaled = image
+    .select(['SR_B1','SR_B2','SR_B3','SR_B4','SR_B5','SR_B6','SR_B7'])
+    .multiply(2.75e-05)
+    .add(-0.2);
+  return image.addBands(scaled, null, true);
+}
+
+// ---- Select best L9 image & apply processing ----
+var landsat9 = landsatCollection.first().clip(aoi);
+// Info
+print('📅 L9 Acquisition Date:', landsat9.date().format('YYYY-MM-DD'));
+print('☁️ L9 Cloud Cover (original):', landsatCollection.first().get('CLOUD_COVER'));
+
+// True Color (still B4-B3-B2)
+Map.addLayer(
+  landsat9,
+  {bands: ['SR_B4', 'SR_B3', 'SR_B2'], min: 0, max: 0.3, gamma: 1.4},
+  'Landsat 9 True Color (Scaled & Masked)'
+);
+
+// 3️⃣ Bands for Classification (L9 SR_B1–SR_B7)
+var bands = ['SR_B1', 'SR_B2', 'SR_B3', 'SR_B4', 'SR_B5', 'SR_B6', 'SR_B7'];
+
+// 4️⃣ Training Data (merge order determines class values: 0–4)
+var training = Agricultural_Land   // 0
+  .merge(Bare_soil)                // 1
+  .merge(Build_up_area)            // 2
+  .merge(Vagitation)               // 3
+  .merge(Water_body);              // 4
+
+var label = 'Class';
+
+// 5️⃣ Sample Points (from L9 only)
+var trainingPoints = landsat9.select(bands).sampleRegions({
+  collection: training,
+  properties: [label],
+  scale: 30,
+  tileScale: 4
+});
+
+// Train/Test Split
+var data = trainingPoints.randomColumn('random', 42);
+var trainSet = data.filter(ee.Filter.lt('random', 0.7));
+var testSet  = data.filter(ee.Filter.gte('random', 0.7));
+
+print('Training points:', trainSet.size());
+print('Testing points:', testSet.size());
+
+// 6️⃣ Train Classifier (Random Forest)
+var classifier = ee.Classifier.smileRandomForest({
+  numberOfTrees: 100,
+  seed: 42
+}).train({
+  features: trainSet,
+  classProperty: label,
+  inputProperties: bands
+});
+
+// 7️⃣ Classify
+var classified = landsat9.select(bands).classify(classifier).clip(aoi);
+
+// Palette & Class Names
+var palette = [
+  '#113aff', // 0: Agricultural Land
+  '#e6c3ba', // 1: Bare Soil
+  '#ff0000', // 2: Built-up Area
+  '#0fdc37', // 3: Vegetation
+  '#1bdff0'  // 4: Water Body
+];
+
+var classNames = [
+  'Agricultural Land',
+  'Bare Soil',
+  'Built-up Area',
+  'Vegetation',
+  'Water Body'
+];
+
+Map.addLayer(
+  classified,
+  {min: 0, max: 4, palette: palette},
+  'LULC Classification 2025 – Landsat 9'
+);
+
+// 8️⃣ Accuracy Assessment
+var validated = testSet.classify(classifier);
+var cm = validated.errorMatrix(label, 'classification');
+print('Confusion Matrix (L9):', cm);
+print('Overall Accuracy (L9):', cm.accuracy());
+print('Kappa Coefficient (L9):', cm.kappa());
+print("Producer's Accuracy (L9):", cm.producersAccuracy());
+print("User's Accuracy (L9):", cm.consumersAccuracy());
+
+// 9️⃣ Area Calculation per class (km²)
+var pixelArea = ee.Image.pixelArea().divide(1e6); // m² → km²
+
+var classAreas = [];
+for (var i = 0; i < 5; i++) {
+  var classMask = classified.eq(i);
+  var area = classMask.multiply(pixelArea).reduceRegion({
+    reducer: ee.Reducer.sum(),
+    geometry: aoi,
+    scale: 30,
+    maxPixels: 1e13
+  }).get('classification');
+  classAreas.push(ee.Number(area).round());
+}
+
+var areasList = ee.List(classAreas);
+
+// Print areas
+for (var j = 0; j < classNames.length; j++) {
+  print(classNames[j] + ' Area (km²) [L9]:', areasList.get(j));
+}
+
+// Total AOI Area
+var totalArea = pixelArea.reduceRegion({
+  reducer: ee.Reducer.sum(),
+  geometry: aoi,
+  scale: 30,
+  maxPixels: 1e13
+}).get('area');
+
+print('Total AOI Area (km²):', ee.Number(totalArea).round());
+
+// Built‑up Area (class 2)
+print('🏙️ Built-up Area (km²) [L9]:', areasList.get(2));
+
+// 🔟 Legend
+var legend = ui.Panel({
+  style: {
+    position: 'bottom-left',
+    padding: '8px 15px',
+    backgroundColor: 'rgba(255,255,255,0.8)'
+  }
+});
+legend.add(ui.Label('LULC Legend - Barishal 2025 (L9)', {
+  fontWeight: 'bold',
+  fontSize: '16px'
+}));
+
+for (var k = 0; k < classNames.length; k++) {
+  var row = ui.Panel({
+    widgets: [
+      ui.Label({
+        style: {
+          backgroundColor: palette[k],
+          padding: '8px',
+          margin: '4px'
+        }
+      }),
+      ui.Label(classNames[k])
+    ],
+    layout: ui.Panel.Layout.Flow('horizontal')
+  });
+  legend.add(row);
+}
+Map.add(legend);
+
+// 1️⃣1️⃣ Export (Landsat 9 classification)
+Export.image.toDrive({
+  image: classified.toByte(),
+  description: 'LULC_Barishal_2025_Landsat9',
+  folder: 'SGS_GEE_Exports',
+  fileNamePrefix: 'LULC_Barishal_2025_L9',
+  region: aoi,
+  scale: 30,
+  crs: 'EPSG:4326',
+  maxPixels: 1e13
+});
+
+// =======================================================================
+// END OF CODE
+// =======================================================================
+var trainingPoints = landsat9.select(bands).sampleRegions(training)
+
+Export.table.toDrive({
+  collection: training,
+  description: 'LULC_Training_Points_GeoJSON',
+  fileFormat: 'GeoJSON'
+});
