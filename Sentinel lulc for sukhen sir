@@ -1,0 +1,356 @@
+// =======================================================================
+// BARISHAL CITY LULC – Sentinel-2 SR (2025)
+// PART-1
+// =======================================================================
+
+// 1️⃣ Load AOI
+var aoi = shapefile.geometry();
+
+Map.centerObject(aoi, 14);
+Map.addLayer(aoi, {color: 'red'}, 'AOI - Barishal City');
+
+// =======================================================================
+// 2️⃣ Cloud Mask Function
+// =======================================================================
+
+function maskS2(image) {
+
+  var qa = image.select('QA60');
+
+  var cloudBitMask = 1 << 10;
+  var cirrusBitMask = 1 << 11;
+
+  var mask = qa.bitwiseAnd(cloudBitMask).eq(0)
+      .and(qa.bitwiseAnd(cirrusBitMask).eq(0));
+
+  return image
+      .updateMask(mask)
+      .divide(10000)
+      .copyProperties(image, ['system:time_start']);
+}
+
+// =======================================================================
+// 3️⃣ Sentinel-2 Image Collection
+// =======================================================================
+
+var sentinelCollection = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+    .filterBounds(aoi)
+    .filterDate('2010-03-02', '2010-03-28')
+    .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 10))
+    .map(maskS2)
+    .sort('CLOUDY_PIXEL_PERCENTAGE');
+
+print('Number of Sentinel Images:', sentinelCollection.size());
+
+// =======================================================================
+// 4️⃣ Composite Image
+// =======================================================================
+
+var sentinel2 = sentinelCollection.median().clip(aoi);
+
+print('Composite Image:', sentinel2);
+
+// Acquisition Date (first image)
+var firstImage = ee.Image(sentinelCollection.first());
+
+print(
+  '📅 First Acquisition Date:',
+  ee.Date(firstImage.get('system:time_start')).format('YYYY-MM-dd')
+);
+
+print(
+  '☁️ Cloud Percentage:',
+  firstImage.get('CLOUDY_PIXEL_PERCENTAGE')
+);
+
+// =======================================================================
+// 5️⃣ RGB Display
+// =======================================================================
+
+Map.addLayer(
+  sentinel2,
+  {
+    bands: ['B4', 'B3', 'B2'],
+    min: 0,
+    max: 0.30,
+    gamma: 1.2
+  },
+  'Sentinel-2 True Color'
+);
+
+// =======================================================================
+// 6️⃣ Classification Bands
+// =======================================================================
+
+var bands = [
+  'B2',   // Blue
+  'B3',   // Green
+  'B4',   // Red
+  'B8',   // NIR
+  'B11',  // SWIR1
+  'B12'   // SWIR2
+];
+
+// =======================================================================
+// 7️⃣ Training Data
+// =======================================================================
+
+var training = Agricultural_Land   // Class 0
+    .merge(Bare_soil)              // Class 1
+    .merge(Build_up_area)          // Class 2
+    .merge(Vegetation)             // Class 3
+    .merge(Water_body);            // Class 4
+
+var label = 'Class';
+
+// =======================================================================
+// 8️⃣ Sample Training Points
+// =======================================================================
+
+var trainingPoints = sentinel2.select(bands).sampleRegions({
+  collection: training,
+  properties: [label],
+  scale: 10,
+  tileScale: 4
+});
+
+print('Training Samples:', trainingPoints.size());
+
+// =======================================================================
+// 9️⃣ Train-Test Split
+// =======================================================================
+
+var data = trainingPoints.randomColumn('random', 42);
+
+var trainSet = data.filter(
+  ee.Filter.lt('random', 0.7)
+);
+
+var testSet = data.filter(
+  ee.Filter.gte('random', 0.7)
+);
+
+print('Training Points:', trainSet.size());
+
+print('Testing Points:', testSet.size());
+
+// =======================================================================
+// END OF PART-1
+// =======================================================================
+// =======================================================================
+// PART-2
+// Random Forest Classification
+// =======================================================================
+
+// 1️⃣ Train Random Forest Classifier
+
+var classifier = ee.Classifier.smileRandomForest({
+  numberOfTrees: 200,
+  seed: 42
+}).train({
+  features: trainSet,
+  classProperty: label,
+  inputProperties: bands
+});
+
+// =======================================================================
+// 2️⃣ Classification
+// =======================================================================
+
+var classified = sentinel2
+  .select(bands)
+  .classify(classifier)
+  .clip(aoi);
+
+// =======================================================================
+// 3️⃣ Color Palette
+// =======================================================================
+
+var palette = [
+  '#113aff', // Agricultural Land
+  '#e6c3ba', // Bare Soil
+  '#ff0000', // Built-up Area
+  '#0fdc37', // Vegetation
+  '#1bdff0'  // Water Body
+];
+
+var classNames = [
+  'Agricultural Land',
+  'Bare Soil',
+  'Built-up Area',
+  'Vegetation',
+  'Water Body'
+];
+
+// =======================================================================
+// 4️⃣ Display Classification
+// =======================================================================
+
+Map.addLayer(
+  classified,
+  {
+    min: 0,
+    max: 4,
+    palette: palette
+  },
+  'LULC Classification 2025 - Sentinel-2'
+);
+
+// =======================================================================
+// 5️⃣ Accuracy Assessment
+// =======================================================================
+
+var validated = testSet.classify(classifier);
+
+var cm = validated.errorMatrix(label, 'classification');
+
+print('Confusion Matrix:', cm);
+print('Overall Accuracy:', cm.accuracy());
+print('Kappa:', cm.kappa());
+print("Producer's Accuracy:", cm.producersAccuracy());
+print("User's Accuracy:", cm.consumersAccuracy());
+
+// =======================================================================
+// 6️⃣ Area Calculation (km²)
+// =======================================================================
+
+var pixelArea = ee.Image.pixelArea().divide(1e6);
+
+var classAreas = [];
+
+for (var i = 0; i < 5; i++) {
+
+  var classMask = classified.eq(i);
+
+  var area = classMask.multiply(pixelArea).reduceRegion({
+
+    reducer: ee.Reducer.sum(),
+
+    geometry: aoi,
+
+    scale: 10,
+
+    maxPixels: 1e13
+
+  }).get('classification');
+
+  classAreas.push(ee.Number(area).round());
+
+}
+
+var areasList = ee.List(classAreas);
+
+for (var j = 0; j < classNames.length; j++) {
+
+  print(classNames[j] + ' Area (km²):', areasList.get(j));
+
+}
+
+// =======================================================================
+// Total AOI Area
+// =======================================================================
+
+var totalArea = pixelArea.reduceRegion({
+
+  reducer: ee.Reducer.sum(),
+
+  geometry: aoi,
+
+  scale: 10,
+
+  maxPixels: 1e13
+
+}).get('area');
+
+print('Total AOI Area (km²):', ee.Number(totalArea).round());
+
+print('🏙️ Built-up Area (km²):', areasList.get(2));
+
+// =======================================================================
+// 7️⃣ Legend
+// =======================================================================
+
+var legend = ui.Panel({
+
+  style: {
+
+    position: 'bottom-left',
+
+    padding: '8px 15px',
+
+    backgroundColor: 'rgba(255,255,255,0.8)'
+
+  }
+
+});
+
+legend.add(ui.Label(
+
+  'LULC Legend - Barishal 2025 (Sentinel-2)',
+
+  {
+
+    fontWeight: 'bold',
+
+    fontSize: '16px'
+
+  }
+
+));
+
+for (var k = 0; k < classNames.length; k++) {
+
+  var row = ui.Panel({
+
+    widgets: [
+
+      ui.Label({
+
+        style: {
+
+          backgroundColor: palette[k],
+
+          padding: '8px',
+
+          margin: '4px'
+
+        }
+
+      }),
+
+      ui.Label(classNames[k])
+
+    ],
+
+    layout: ui.Panel.Layout.Flow('horizontal')
+
+  });
+
+  legend.add(row);
+
+}
+
+Map.add(legend);
+
+// =======================================================================
+// 8️⃣ Export Classified Image
+// =======================================================================
+
+Export.image.toDrive({
+  image: classified.toByte(),
+  description: 'LULC_Barishal_2016_Sentinel2',
+  folder: 'SGS_GEE_Exports',
+  fileNamePrefix: 'LULC_Barishal_2016_S2',
+  region: aoi,
+  scale: 10,
+  crs: 'EPSG:4326',
+  maxPixels: 1e13
+});
+
+// 9️⃣ Export Training Samples
+
+Export.table.toDrive({
+  collection: trainingPoints,
+  description: 'LULC_Training_Points_Sentinel2',
+  fileFormat: 'GeoJSON'
+});
